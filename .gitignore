@@ -1,0 +1,9 @@
+node_modules/
+.env
+*.env
+private/
+data/
+*.sqlite*
+*.log
+*.tgz
+!vendor/*.tgz
