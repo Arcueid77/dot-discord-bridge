@@ -28,5 +28,7 @@
     "check": "node scripts/check.js",
     "test": "node --test --test-concurrency=1 test/*.test.js"
   },
-  "dependencies": {}
+  "dependencies": {
+    "ws": "8.22.0"
+  }
 }

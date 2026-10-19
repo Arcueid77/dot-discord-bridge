@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {setTimeout as delay} from 'node:timers/promises';
+import {once} from 'node:events';
+import WebSocketClient,{WebSocketServer} from 'ws';
 import {createProvider} from '../src/provider.js';
 
 const credentials={botToken:'synthetic.bot.token.abcdefghijklmnop',ownerId:'1000',conversationId:'2000'};
@@ -14,10 +16,12 @@ function fixture(options={}) {
   const sockets=[];
   const calls=[];
   class Socket extends EventTarget {
-    constructor(url){super();this.url=url;this.readyState=1;this.sent=[];sockets.push(this);}
+    constructor(url,transportOptions){super();this.url=url;this.transportOptions=transportOptions;this.readyState=1;this.sent=[];this.terminations=0;sockets.push(this);}
     send(value){this.sent.push(JSON.parse(value));}
     frame(frame){this.dispatchEvent(new MessageEvent('message',{data:JSON.stringify(frame)}));}
-    close(code=1006){if(this.readyState===3)return;this.readyState=3;queueMicrotask(()=>{const event=new Event('close');Object.defineProperty(event,'code',{value:code});this.dispatchEvent(event);});}
+    emitClose(code){this.readyState=3;queueMicrotask(()=>{const event=new Event('close');Object.defineProperty(event,'code',{value:code});this.dispatchEvent(event);});}
+    close(code=1006){if(this.readyState===3)return;if(options.ignoreClose){this.readyState=2;return;}this.emitClose(code);}
+    terminate(){this.terminations++;if(this.readyState!==3)this.emitClose(1006);}
   }
   const fetch=async(url,init)=>{
     assert.equal(new URL(url).origin,'https://discord.com');
@@ -48,6 +52,7 @@ test('checks private channel and identifies with direct-message intent only',asy
   await provider.start();
   assert.equal(provider.status().connected,false);
   assert.equal(fx.sockets[0].url,'wss://gateway.discord.gg/?v=10&encoding=json');
+  assert.deepEqual(fx.sockets[0].transportOptions,{followRedirects:false,maxPayload:1024*1024,handshakeTimeout:15000,perMessageDeflate:false,rejectUnauthorized:true});
   ready(fx.sockets[0]);
   await until(()=>provider.status().connected&&fx.sockets[0].sent.some(f=>f.op===2));
   assert.equal(fx.sockets[0].sent.find(f=>f.op===2).d.intents,4096);
@@ -209,4 +214,72 @@ test('stop drains ingestion before returning and preserves only the completed se
   let stopped=false;const stop=provider.stop().then(()=>{stopped=true;});
   await delay(10);assert.equal(stopped,false);gate.resolve();await stop;
   assert.equal(state.get('gatewaySession').sequence,2);
+});
+
+test('stop force-terminates a peer that never completes the close handshake',async()=>{
+  const fx=fixture({ignoreClose:true});
+  const provider=createProvider({...fx,credentials,state:memory(),random:()=>1,timing:{closeGraceMs:10},onMessage:async()=>{}});
+  await provider.start();const ws=fx.sockets[0];ready(ws);await until(()=>provider.status().connected);
+  await provider.stop();
+  assert.equal(ws.terminations,1);
+  assert.equal(ws.readyState,3);
+  assert.equal(provider.status().running,false);
+  assert.equal(fx.sockets.length,1);
+});
+
+test('unsafe optional attachment metadata cannot poison durable ingestion',async t=>{
+  const fx=fixture();const state=memory();const seen=[];
+  const provider=createProvider({...fx,credentials,state,random:()=>1,onMessage:async m=>{
+    for(const attachment of m.attachments){
+      for(const key of ['name','mimeType'])if(attachment[key]!==undefined){
+        assert.notEqual(attachment[key],'');assert.doesNotMatch(attachment[key],/[\u0000-\u001f\u007f]|\p{Surrogate}/u);
+      }
+    }
+    seen.push(m);
+  }});
+  t.after(()=>provider.stop());await provider.start();const ws=fx.sockets[0];ready(ws);await until(()=>provider.status().connected);
+  ws.frame({op:0,t:'MESSAGE_CREATE',s:2,d:{...message(),attachments:[
+    {filename:'',content_type:''},
+    {filename:'private\nfilename',content_type:'audio/ogg\r'},
+    {filename:'a'.repeat(254)+'😀.ogg',content_type:'audio/ogg'}
+  ]}});
+  ws.frame({op:0,t:'MESSAGE_CREATE',s:3,d:message('3001','Next message')});
+  await until(()=>state.get('gatewaySession').sequence===3);
+  assert.equal(seen.length,2);
+  assert.deepEqual(seen[0].attachments.slice(0,2),[{kind:'file'},{kind:'file'}]);
+  assert.equal(seen[0].attachments[2].name,'a'.repeat(254));
+});
+
+test('unsupported invalid text does not permanently block the durable sequence',async t=>{
+  const fx=fixture();const state=memory();const seen=[];
+  const provider=createProvider({...fx,credentials,state,random:()=>1,onMessage:async m=>seen.push(m)});
+  t.after(()=>provider.stop());await provider.start();const ws=fx.sockets[0];ready(ws);await until(()=>provider.status().connected);
+  ws.frame({op:0,t:'MESSAGE_CREATE',s:2,d:message('3000','Unsupported\u0000text')});
+  ws.frame({op:0,t:'MESSAGE_CREATE',s:3,d:message('3001','Valid next message\nwith a line break')});
+  await until(()=>state.get('gatewaySession').sequence===3);
+  assert.equal(seen.length,1);assert.equal(seen[0].id,'3001');
+});
+
+test('real ws parser rejects an over-limit wire message before application dispatch',async t=>{
+  const server=new WebSocketServer({host:'127.0.0.1',port:0,perMessageDeflate:false});
+  await once(server,'listening');
+  const wireClients=[];
+  const closes=[];
+  const transportErrors=[];
+  class LocalSocket extends WebSocketClient{
+    constructor(_officialUrl,options){
+      super(`ws://127.0.0.1:${server.address().port}`,options);
+      wireClients.push(this);
+      this.on('close',code=>closes.push(code));
+      this.on('error',error=>transportErrors.push(error.code));
+    }
+  }
+  const fx=fixture();
+  const provider=createProvider({...fx,WebSocket:LocalSocket,credentials,state:memory(),onMessage:async()=>assert.fail('oversize payload must not reach ingestion')});
+  t.after(async()=>{await provider.stop();for(const client of server.clients)client.terminate();await new Promise(resolve=>server.close(resolve));});
+  server.on('connection',client=>{client.on('error',()=>{});client.send('x'.repeat(1024*1024+1));});
+  await provider.start();
+  await until(()=>closes.length===1);
+  assert.equal(wireClients[0].readyState,3);
+  assert.deepEqual(transportErrors,['WS_ERR_UNSUPPORTED_MESSAGE_LENGTH']);
 });

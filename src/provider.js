@@ -1,9 +1,18 @@
 import {createHash} from 'node:crypto';
+import WebSocketClient from 'ws';
 
 const API = 'https://discord.com/api/v10';
 const MAX_BODY = 2 * 1024 * 1024;
 const snowflake = value => typeof value === 'string' && /^[1-9][0-9]{0,19}$/.test(value);
 const fail = () => new Error('Discord transport failed.');
+
+function optionalMetadata(value, limit) {
+  if (typeof value !== 'string' || !value || /[\u0000-\u001f\u007f]|\p{Surrogate}/u.test(value)) return undefined;
+  let clipped = value.slice(0, limit);
+  // A UTF-16 bound may land between the two halves of the final emoji.
+  if (/\p{Surrogate}$/u.test(clipped)) clipped = clipped.slice(0, -1);
+  return clipped || undefined;
+}
 
 function gatewayUrl(value) {
   try {
@@ -34,7 +43,7 @@ async function json(response) {
   }
 }
 
-export function createProvider({credentials, state, onMessage, signal, fetch = globalThis.fetch, WebSocket = globalThis.WebSocket, random = Math.random}) {
+export function createProvider({credentials, state, onMessage, signal, fetch = globalThis.fetch, WebSocket = WebSocketClient, random = Math.random, timing = {}}) {
   const {botToken, ownerId, conversationId} = credentials ?? {};
   if (typeof botToken !== 'string' || !/^[A-Za-z0-9_.-]{20,256}$/.test(botToken) || !snowflake(ownerId) || !snowflake(conversationId)) throw new Error('Discord credentials require a bot token, owner user ID and private channel ID.');
   const controller = new AbortController();
@@ -94,12 +103,13 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
   async function ingest(data) {
     if (!data || data.guild_id || data.webhook_id || data.author?.bot || data.author?.system || data.author?.id !== ownerId || data.author.id === selfId || data.channel_id !== conversationId || ![0, 19].includes(data.type) || !snowflake(data.id)) return;
     const text = typeof data.content === 'string' ? data.content : '';
-    if (text.length > 20000) return;
+    if (text.length > 20000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]|\p{Surrogate}/u.test(text)) return;
     const attachments = Array.isArray(data.attachments) ? data.attachments.slice(0, 10).map(value => {
-      const mime = typeof value?.content_type === 'string' ? value.content_type.slice(0, 127) : undefined;
+      const mime = optionalMetadata(value?.content_type, 127);
       const item = {kind:mime?.startsWith('image/') ? 'image' : mime?.startsWith('audio/') ? 'audio' : mime?.startsWith('video/') ? 'video' : 'file'};
       if (mime) item.mimeType = mime;
-      if (typeof value?.filename === 'string') item.name = value.filename.slice(0, 255);
+      const name = optionalMetadata(value?.filename, 255);
+      if (name) item.name = name;
       return item;
     }) : [];
     if (!text && !attachments.length) return;
@@ -111,7 +121,10 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
 
   function connect() {
     return new Promise(resolve => {
-      const ws = new WebSocket(gatewayUrl(resume?.gatewayUrl ?? initialGateway));
+      const ws = new WebSocket(gatewayUrl(resume?.gatewayUrl ?? initialGateway), {
+        followRedirects:false, maxPayload:1024 * 1024, handshakeTimeout:15000,
+        perMessageDeflate:false, rejectUnauthorized:true
+      });
       socket = ws;
       let closed = false;
       let failed = false;
@@ -141,6 +154,7 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
         ws.removeEventListener('message', receive);
         ws.removeEventListener('close', onClose);
         ws.removeEventListener('error', onError);
+        if (socket === ws) socket = undefined;
         dispatch.catch(() => {}).then(resolve);
       }
       function disconnect() {
@@ -151,7 +165,18 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
         clearTimeout(heartbeat);
         clearTimeout(identifyTimer);
         try { ws.close(4000); } catch { /* Already closed. */ }
-        if (!closeTimer) closeTimer = setTimeout(finish, 5000);
+        if (!closeTimer) closeTimer = setTimeout(() => {
+          // A peer may never acknowledge the closing handshake. The default ws
+          // client can destroy its owned connection; do not merely forget it.
+          if (typeof ws.terminate === 'function') {
+            try { ws.terminate(); } catch { /* An already closed socket is safe. */ }
+            if (ws.readyState === 3) finish();
+          } else {
+            // Compatibility for injected EventTarget fixtures. Production uses
+            // the pinned, terminable ws client above.
+            finish();
+          }
+        }, timing.closeGraceMs ?? 5000);
       }
       function shutdown() { disconnect(); }
       function onError() { disconnect(); }
