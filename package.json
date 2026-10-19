@@ -29,6 +29,7 @@
     "test": "node --test --test-concurrency=1 test/*.test.js"
   },
   "dependencies": {
-    "ws": "8.22.0"
+    "ws": "8.22.0",
+    "@dot-bridge/core": "file:vendor/dot-bridge-core-0.4.0.tgz"
   }
 }
