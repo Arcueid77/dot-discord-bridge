@@ -3,8 +3,31 @@ import WebSocketClient from 'ws';
 
 const API = 'https://discord.com/api/v10';
 const MAX_BODY = 2 * 1024 * 1024;
+const MAX_MEDIA = 8 * 1024 * 1024;
 const snowflake = value => typeof value === 'string' && /^[1-9][0-9]{0,19}$/.test(value);
 const fail = () => new Error('Discord transport failed.');
+const mime = value => typeof value === 'string' && /^[a-zA-Z0-9!#$&^_.+-]+\/[a-zA-Z0-9!#$&^_.+-]+$/.test(value) && value.length <= 127;
+
+function validateMediaReply({media, text = ''} = {}) {
+  if (!media || !['image', 'audio', 'file'].includes(media.type) || !Buffer.isBuffer(media.data) || media.data.length < 1 || media.data.length > MAX_MEDIA) throw new Error('Discord media must contain 1 byte to 8 MiB.');
+  if (!mime(media.mimeType) || typeof media.name !== 'string' || !media.name || media.name.length > 255 || /[\u0000-\u001f\u007f/\\]|\p{Surrogate}/u.test(media.name) || ['.', '..'].includes(media.name)) throw new Error('Discord media name or MIME type is invalid.');
+  if (media.type === 'image' && !['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(media.mimeType)) throw new Error('Discord image replies require JPEG, PNG, GIF or WebP.');
+  if (media.type === 'audio' && !['audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/webm', 'audio/flac'].includes(media.mimeType)) throw new Error('Discord audio format is unsupported; send it as a file.');
+  if (typeof text !== 'string' || text.length > 2000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]|\p{Surrogate}/u.test(text)) throw new Error('Discord media caption must contain at most 2000 characters.');
+}
+
+function attachmentUrl(value, conversationId, attachmentId) {
+  try {
+    if (typeof value !== 'string' || value.length > 4096) throw fail();
+    const url = new URL(value);
+    const prefix = `/attachments/${conversationId}/${attachmentId}/`;
+    if (url.protocol !== 'https:' || url.hostname !== 'cdn.discordapp.com' || url.port || url.username || url.password || url.hash || !url.pathname.startsWith(prefix)) throw fail();
+    const name = decodeURIComponent(url.pathname.slice(prefix.length));
+    if (!name || /[/\\\u0000-\u001f\u007f]/u.test(name) || ['.', '..'].includes(name)) throw fail();
+    for (const [key, entry] of url.searchParams) if (!['ex', 'is', 'hm'].includes(key) || !/^[a-fA-F0-9]{1,128}$/.test(entry)) throw fail();
+    return url.href;
+  } catch { throw new Error('Discord attachment address is invalid.'); }
+}
 
 function optionalMetadata(value, limit) {
   if (typeof value !== 'string' || !value || /[\u0000-\u001f\u007f]|\p{Surrogate}/u.test(value)) return undefined;
@@ -71,13 +94,58 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
       try {
         const response = await fetch(`${API}${path}`, {
           method:payload === undefined ? 'GET' : 'POST', redirect:'error',
-          headers:{authorization:`Bot ${botToken}`, 'content-type':'application/json', 'user-agent':'DiscordBot (https://github.com/Arcueid77/dot-discord-bridge, 0.1.0)'},
-          ...(payload === undefined ? {} : {body:JSON.stringify(payload)}),
+          headers:{authorization:`Bot ${botToken}`, ...(payload instanceof FormData ? {} : {'content-type':'application/json'}), 'user-agent':'DiscordBot (https://github.com/Arcueid77/dot-discord-bridge, 0.1.0)'},
+          ...(payload === undefined ? {} : {body:payload instanceof FormData ? payload : JSON.stringify(payload)}),
           signal:AbortSignal.any([controller.signal, deadline.signal])
         });
         return await json(response);
       } catch { throw fail(); }
-      finally { clearTimeout(timer); }
+      finally { clearTimeout(timer); deadline.abort(); }
+    })();
+    requests.add(task);
+    task.then(() => requests.delete(task), () => requests.delete(task));
+    return task;
+  }
+
+  function binding(message) {
+    if (!running || controller.signal.aborted) throw new Error('Discord provider is not running.');
+    if (message?.senderId !== ownerId || message?.conversationId !== conversationId || !snowflake(message.id) || message.replyContext?.messageId !== message.id) throw new Error('Discord reply binding is invalid.');
+  }
+
+  function replyPayload(message, idempotencyKey, content) {
+    if (typeof idempotencyKey !== 'string' || !idempotencyKey || idempotencyKey.length > 1024) throw new Error('Discord reply requires a stable idempotency key.');
+    return {content, nonce:createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 24), enforce_nonce:true,
+      allowed_mentions:{parse:[], replied_user:false},
+      message_reference:{message_id:message.id, channel_id:conversationId, fail_if_not_exists:false}};
+  }
+
+  function download(url) {
+    const task = (async () => {
+      const deadline = new AbortController();
+      const timer = setTimeout(() => deadline.abort(), 30000);
+      timer.unref?.();
+      try {
+        // CDN requests never receive the bot token or API authorization headers.
+        const response = await fetch(url, {redirect:'error', signal:AbortSignal.any([controller.signal, deadline.signal])});
+        if (!response.ok || response.redirected || !response.body || (response.url && response.url !== url)) throw fail();
+        const size = response.headers.get('content-length');
+        if (size !== null && (!/^\d+$/.test(size) || Number(size) > MAX_MEDIA)) throw fail();
+        const reader = response.body.getReader();
+        let length = 0;
+        const chunks = [];
+        try {
+          for (;;) {
+            const {done, value} = await reader.read();
+            if (done) break;
+            length += value.byteLength;
+            if (length > MAX_MEDIA || controller.signal.aborted || deadline.signal.aborted) throw fail();
+            chunks.push(Buffer.from(value));
+          }
+          if (!length) throw fail();
+          return {data:Buffer.concat(chunks), mimeType:response.headers.get('content-type')?.split(';')[0]?.trim()};
+        } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+      } catch { throw fail(); }
+      finally { clearTimeout(timer); deadline.abort(); }
     })();
     requests.add(task);
     task.then(() => requests.delete(task), () => requests.delete(task));
@@ -112,8 +180,9 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
       if (name) item.name = name;
       return item;
     }) : [];
+    const references = Array.isArray(data.attachments) ? data.attachments.slice(0, 10).map(value => snowflake(value?.id) ? {id:value.id, ...(Number.isSafeInteger(value.size) && value.size >= 0 ? {size:value.size} : {})} : null) : [];
     if (!text && !attachments.length) return;
-    const message = {id:data.id, senderId:ownerId, conversationId, text, replyContext:{messageId:data.id}, attachments};
+    const message = {id:data.id, senderId:ownerId, conversationId, text, replyContext:{messageId:data.id, attachments:references}, attachments};
     const timestamp = typeof data.timestamp === 'string' ? Date.parse(data.timestamp) : NaN;
     if (Number.isFinite(timestamp) && timestamp > 0) message.timestamp = timestamp;
     await onMessage(message);
@@ -318,17 +387,39 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
       await Promise.allSettled([...requests]);
     },
     status() { return {connected, running, blocked}; },
-    async sendReply({message, text, idempotencyKey}) {
-      if (!running || controller.signal.aborted) throw new Error('Discord provider is not running.');
-      if (message?.senderId !== ownerId || message?.conversationId !== conversationId || !snowflake(message.id) || message.replyContext?.messageId !== message.id) throw new Error('Discord reply binding is invalid.');
+    validateMediaReply,
+    async readAttachment({message, attachmentIndex}) {
+      binding(message);
+      if (!Number.isSafeInteger(attachmentIndex) || attachmentIndex < 0 || attachmentIndex >= (message.attachments?.length ?? 0) || attachmentIndex >= 10) throw new Error('Discord attachment is unavailable.');
+      const ref = message.replyContext.attachments?.[attachmentIndex];
+      const item = message.attachments[attachmentIndex];
+      if (!snowflake(ref?.id) || !['image', 'audio', 'file'].includes(item.kind) || (ref.size !== undefined && (!Number.isSafeInteger(ref.size) || ref.size < 0 || ref.size > MAX_MEDIA))) throw new Error('Discord attachment is unavailable or exceeds 8 MiB.');
+      // Refresh this original private message to obtain a current signed CDN URL.
+      const current = await request(`/channels/${conversationId}/messages/${message.id}`);
+      if (current?.id !== message.id || current.channel_id !== conversationId || current.guild_id || current.webhook_id || current.author?.id !== ownerId || current.author?.bot || current.author?.system || !Array.isArray(current.attachments)) throw fail();
+      const file = current.attachments.find(value => value?.id === ref.id);
+      if (!file || !Number.isSafeInteger(file.size) || file.size < 1 || file.size > MAX_MEDIA) throw fail();
+      const result = await download(attachmentUrl(file.url, conversationId, ref.id));
+      return {...result, mimeType:mime(result.mimeType) && result.mimeType !== 'application/octet-stream' ? result.mimeType : mime(file.content_type) ? file.content_type : 'application/octet-stream', ...(item.name ? {name:item.name} : {})};
+    },
+    async sendMediaReply({message, media, text = '', idempotencyKey, authorize = () => {}}) {
+      binding(message);
+      validateMediaReply({media, text});
+      const payload = replyPayload(message, idempotencyKey, text);
+      payload.attachments = [{id:0, filename:media.name}];
+      const form = new FormData();
+      form.set('payload_json', JSON.stringify(payload));
+      form.set('files[0]', new Blob([media.data], {type:media.mimeType}), media.name);
+      authorize();
+      const sent = await request(`/channels/${conversationId}/messages`, form);
+      if (!snowflake(sent?.id) || sent.channel_id !== conversationId) throw fail();
+      return {providerMessageId:sent.id};
+    },
+    async sendReply({message, text, idempotencyKey, authorize = () => {}}) {
+      binding(message);
       if (typeof text !== 'string' || !text.trim() || text.length > 2000) throw new Error('Discord reply must contain 1 to 2000 characters.');
-      if (typeof idempotencyKey !== 'string' || !idempotencyKey || idempotencyKey.length > 1024) throw new Error('Discord reply requires a stable idempotency key.');
-      const sent = await request(`/channels/${conversationId}/messages`, {
-        content:text,
-        nonce:createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 24), enforce_nonce:true,
-        allowed_mentions:{parse:[], replied_user:false},
-        message_reference:{message_id:message.id, channel_id:conversationId, fail_if_not_exists:false}
-      });
+      authorize();
+      const sent = await request(`/channels/${conversationId}/messages`, replyPayload(message, idempotencyKey, text));
       if (!snowflake(sent?.id) || sent.channel_id !== conversationId) throw fail();
       return {providerMessageId:sent.id};
     }

@@ -7,7 +7,7 @@ and outbox are supplied by `@dot-bridge/core/channels`.
 Initialization checks the bot identity, exact type-1 DM recipient and Gateway
 address before opening a socket. REST is restricted to `https://discord.com` and
 Gateway addresses to `gateway*.discord.gg` under the explicit gateway hostname
-pattern. Redirects are refused, HTTP bodies are limited to 2 MiB, Gateway frames
+pattern. Redirects are refused, JSON responses are limited to 2 MiB, Gateway frames
 to 1 MiB, pending dispatches to 256, and initialization/request timeouts are
 bounded. Incoming events never supply a network destination.
 
@@ -22,6 +22,14 @@ Replies use the bound stored channel, disable allowed mentions, hash core's
 stable idempotency key to a 24-character nonce and request `enforce_nonce`.
 There is no send retry, including after 429, timeout or ambiguous failure.
 
+Attachments keep only public metadata in the message projection and store IDs in
+encrypted reply context. Reads refresh the original owner's DM message, match
+the attachment ID, then download from the exact `cdn.discordapp.com/attachments/`
+path for that channel and attachment, without a bot header. Downloads and uploads
+are bounded to 8 MiB. Uploads use byte-backed multipart fields; audio is a normal
+attachment, not Discord's native voice-note waveform. Both text and media call
+the core authorization guard immediately before the final REST request.
+
 Fixture tests exercise initialization and scope, ingestion ordering/failure,
 resume persistence, heartbeat liveness while ingestion is delayed, fatal close,
 attachment metadata, nonce, uncertain send, private binding, bounded responses
@@ -35,6 +43,7 @@ Protocol references:
 - https://docs.discord.com/developers/events/gateway
 - https://docs.discord.com/developers/events/gateway-events
 - https://docs.discord.com/developers/resources/message#create-message
+- https://docs.discord.com/developers/reference#uploading-files
 - https://docs.discord.com/developers/topics/opcodes-and-status-codes
 
 The adapter layout was compared with cc-connect at
