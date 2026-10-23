@@ -30,6 +30,6 @@
   },
   "dependencies": {
     "ws": "8.22.0",
-    "@dot-bridge/core": "file:vendor/dot-bridge-core-0.5.0.tgz"
+    "@dot-bridge/core": "file:vendor/dot-bridge-core-0.5.1.tgz"
   }
 }
