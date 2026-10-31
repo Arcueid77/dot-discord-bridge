@@ -22,11 +22,17 @@ Replies use the bound stored channel, disable allowed mentions, hash core's
 stable idempotency key to a 24-character nonce and request `enforce_nonce`.
 There is no send retry, including after 429, timeout or ambiguous failure.
 
+`sendReply` accepts at most 20,000 well-formed UTF-16 characters / 60,000 UTF-8
+bytes. Above the native 2,000-character limit it makes the existing single
+multipart file reply with `answer.txt`, the original message reference and the
+same nonce discipline. It does not split the final answer or send explanatory
+text separately. A failed/uncertain file send never falls back to a text send.
+
 Attachments keep only public metadata in the message projection and store IDs in
 encrypted reply context. Reads refresh the original owner's DM message, match
 the attachment ID, then download from the exact `cdn.discordapp.com/attachments/`
 path for that channel and attachment, without a bot header. Downloads and uploads
-are bounded to 8 MiB. Uploads use byte-backed multipart fields; audio is a normal
+are bounded to 5 MiB. Uploads use byte-backed multipart fields; audio is a normal
 attachment, not Discord's native voice-note waveform. Both text and media call
 the core authorization guard immediately before the final REST request.
 

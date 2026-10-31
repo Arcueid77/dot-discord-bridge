@@ -55,6 +55,23 @@ async function fixture(t,options={}){
   return {provider,message:received,calls,original};
 }
 
+test('long answers use a single UTF-8 file reply with the same nonce and original message reference',async t=>{
+  const fx=await fixture(t);
+  const text='汉'.repeat(19998)+'🌏';
+  await fx.provider.sendReply({message:fx.message,text,idempotencyKey:'long'});
+  const call=fx.calls.at(-1),form=call.init.body;
+  assert.ok(form instanceof FormData);
+  assert.equal(await form.get('files[0]').text(),text);
+  const body=JSON.parse(form.get('payload_json'));
+  assert.deepEqual(body.attachments,[{id:0,filename:'answer.txt'}]);
+  assert.equal(body.message_reference.message_id,'3000');
+  assert.equal(body.enforce_nonce,true);
+  const count=fx.calls.length;
+  await assert.rejects(fx.provider.sendReply({message:fx.message,text:'x\uD800',idempotencyKey:'invalid'}));
+  await assert.rejects(fx.provider.sendReply({message:fx.message,text:'x'.repeat(20001),idempotencyKey:'large'}));
+  assert.equal(fx.calls.length,count);
+});
+
 test('reads each attachment via refreshed original-message URL with no CDN credentials',async t=>{
   const fx=await fixture(t);
   assert.deepEqual(channel.media,{read:['image','audio','file'],reply:['image','audio','file']});
@@ -63,6 +80,14 @@ test('reads each attachment via refreshed original-message URL with no CDN crede
   for(let i=0;i<3;i++)assert.deepEqual((await fx.provider.readAttachment({message:fx.message,attachmentIndex:i})).data,Buffer.from('DATA'));
   assert.equal(fx.calls.filter(c=>c.url.endsWith('/messages/3000')).length,3);
   assert.equal(fx.calls.filter(c=>c.url.includes('cdn.discordapp.com')).length,3);
+});
+
+test('an uncertain long-answer file POST never retries or switches to a native text message',async t=>{
+  const fx=await fixture(t,{send:async()=>{throw new Error('private uncertain result');}});
+  await assert.rejects(fx.provider.sendReply({message:fx.message,text:'汉'.repeat(2001),idempotencyKey:'long'}));
+  const sends=fx.calls.filter(call=>call.url.endsWith('/channels/2000/messages'));
+  assert.equal(sends.length,1);
+  assert.ok(sends[0].init.body instanceof FormData);
 });
 
 test('uploads all media kinds as bytes with bound reply reference and stable nonce',async t=>{
@@ -86,8 +111,8 @@ test('denies changed owner/channel and indexes before HTTP requests',async t=>{
   const fx=await fixture(t);const count=fx.calls.length;
   for(const message of [{...fx.message,senderId:'9999'},{...fx.message,conversationId:'9999'},{...fx.message,replyContext:{messageId:'9999'}}])await assert.rejects(fx.provider.readAttachment({message,attachmentIndex:0}),/binding/);
   for(const attachmentIndex of [-1,0.1,10])await assert.rejects(fx.provider.readAttachment({message:fx.message,attachmentIndex}),/unavailable/);
-  const message=structuredClone(fx.message);message.replyContext.attachments[0].size=8*1024*1024+1;
-  await assert.rejects(fx.provider.readAttachment({message,attachmentIndex:0}),/8 MiB/);
+  const message=structuredClone(fx.message);message.replyContext.attachments[0].size=5*1024*1024+1;
+  await assert.rejects(fx.provider.readAttachment({message,attachmentIndex:0}),/5 MiB/);
   assert.equal(fx.calls.length,count);
 });
 
@@ -111,14 +136,14 @@ test('blocks CDN redirects, final URL changes and streamed oversize bodies',asyn
   for(const download of [
     ()=>{const r=new Response('DATA');Object.defineProperty(r,'redirected',{value:true});return r;},
     ()=>{const r=new Response('DATA');Object.defineProperty(r,'url',{value:'https://evil.invalid/file'});return r;},
-    ()=>new Response('DATA',{headers:{'content-length':String(8*1024*1024+1)}}),
-    ()=>new Response(new ReadableStream({start(c){c.enqueue(new Uint8Array(8*1024*1024));c.enqueue(new Uint8Array(1));c.close();}}))
+    ()=>new Response('DATA',{headers:{'content-length':String(5*1024*1024+1)}}),
+    ()=>new Response(new ReadableStream({start(c){c.enqueue(new Uint8Array(5*1024*1024));c.enqueue(new Uint8Array(1));c.close();}}))
   ]){const fx=await fixture(t,{download});await assert.rejects(fx.provider.readAttachment({message:fx.message,attachmentIndex:0}),/Discord transport failed/);await fx.provider.stop();}
 });
 
 test('validates bytes, names, MIME and caption synchronously before queueing',async t=>{
   const fx=await fixture(t);const base={type:'file',mimeType:'application/pdf',name:'a.pdf',data:Buffer.from('A')};
-  for(const media of [{...base,data:'https://evil.invalid/x'},{...base,data:Buffer.alloc(0)},{...base,data:Buffer.alloc(8*1024*1024+1)},{...base,name:'../x'},{...base,name:'a\r\nb'},{...base,mimeType:'text/html\r\nX: y'},{...base,type:'image'},{...base,type:'audio'}])assert.throws(()=>fx.provider.validateMediaReply({media}));
+  for(const media of [{...base,data:'https://evil.invalid/x'},{...base,data:Buffer.alloc(0)},{...base,data:Buffer.alloc(5*1024*1024+1)},{...base,name:'../x'},{...base,name:'a\r\nb'},{...base,mimeType:'text/html\r\nX: y'},{...base,type:'image'},{...base,type:'audio'}])assert.throws(()=>fx.provider.validateMediaReply({media}));
   assert.throws(()=>fx.provider.validateMediaReply({media:base,text:'x'.repeat(2001)}),/2000/);
 });
 

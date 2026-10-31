@@ -1,15 +1,16 @@
 import {createHash} from 'node:crypto';
 import WebSocketClient from 'ws';
+import {channel} from './channel.js';
+import {MAX_MEDIA_BYTES as MAX_MEDIA} from '@dot-bridge/core/channels/media.js';
 
 const API = 'https://discord.com/api/v10';
 const MAX_BODY = 2 * 1024 * 1024;
-const MAX_MEDIA = 8 * 1024 * 1024;
 const snowflake = value => typeof value === 'string' && /^[1-9][0-9]{0,19}$/.test(value);
 const fail = () => new Error('Discord transport failed.');
 const mime = value => typeof value === 'string' && /^[a-zA-Z0-9!#$&^_.+-]+\/[a-zA-Z0-9!#$&^_.+-]+$/.test(value) && value.length <= 127;
 
 function validateMediaReply({media, text = ''} = {}) {
-  if (!media || !['image', 'audio', 'file'].includes(media.type) || !Buffer.isBuffer(media.data) || media.data.length < 1 || media.data.length > MAX_MEDIA) throw new Error('Discord media must contain 1 byte to 8 MiB.');
+  if (!media || !['image', 'audio', 'file'].includes(media.type) || !Buffer.isBuffer(media.data) || media.data.length < 1 || media.data.length > MAX_MEDIA) throw new Error('Discord media must contain 1 byte to 5 MiB.');
   if (!mime(media.mimeType) || typeof media.name !== 'string' || !media.name || media.name.length > 255 || /[\u0000-\u001f\u007f/\\]|\p{Surrogate}/u.test(media.name) || ['.', '..'].includes(media.name)) throw new Error('Discord media name or MIME type is invalid.');
   if (media.type === 'image' && !['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(media.mimeType)) throw new Error('Discord image replies require JPEG, PNG, GIF or WebP.');
   if (media.type === 'audio' && !['audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/webm', 'audio/flac'].includes(media.mimeType)) throw new Error('Discord audio format is unsupported; send it as a file.');
@@ -343,7 +344,7 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
     connected = false;
   }
 
-  return {
+  const provider = {
     async start() {
       if (started || controller.signal.aborted) throw new Error('Discord provider cannot be started.');
       started = true;
@@ -393,7 +394,7 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
       if (!Number.isSafeInteger(attachmentIndex) || attachmentIndex < 0 || attachmentIndex >= (message.attachments?.length ?? 0) || attachmentIndex >= 10) throw new Error('Discord attachment is unavailable.');
       const ref = message.replyContext.attachments?.[attachmentIndex];
       const item = message.attachments[attachmentIndex];
-      if (!snowflake(ref?.id) || !['image', 'audio', 'file'].includes(item.kind) || (ref.size !== undefined && (!Number.isSafeInteger(ref.size) || ref.size < 0 || ref.size > MAX_MEDIA))) throw new Error('Discord attachment is unavailable or exceeds 8 MiB.');
+      if (!snowflake(ref?.id) || !['image', 'audio', 'file'].includes(item.kind) || (ref.size !== undefined && (!Number.isSafeInteger(ref.size) || ref.size < 0 || ref.size > MAX_MEDIA))) throw new Error('Discord attachment is unavailable or exceeds 5 MiB.');
       // Refresh this original private message to obtain a current signed CDN URL.
       const current = await request(`/channels/${conversationId}/messages/${message.id}`);
       if (current?.id !== message.id || current.channel_id !== conversationId || current.guild_id || current.webhook_id || current.author?.id !== ownerId || current.author?.bot || current.author?.system || !Array.isArray(current.attachments)) throw fail();
@@ -417,11 +418,17 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
     },
     async sendReply({message, text, idempotencyKey, authorize = () => {}}) {
       binding(message);
-      if (typeof text !== 'string' || !text.trim() || text.length > 2000) throw new Error('Discord reply must contain 1 to 2000 characters.');
+      if (typeof text !== 'string' || !text.trim() || !text.isWellFormed() || text.length > channel.maxReplyText || Buffer.byteLength(text) > 60000) throw new Error('Discord reply must contain 1 to 20,000 characters.');
+      if (text.length > channel.nativeMaxReplyText) {
+        const data = Buffer.from(text, 'utf8');
+        try { return await provider.sendMediaReply({message, media: {type: 'file', data, mimeType: 'text/plain', name: 'answer.txt'}, idempotencyKey, authorize}); }
+        finally { data.fill(0); }
+      }
       authorize();
       const sent = await request(`/channels/${conversationId}/messages`, replyPayload(message, idempotencyKey, text));
       if (!snowflake(sent?.id) || sent.channel_id !== conversationId) throw fail();
       return {providerMessageId:sent.id};
     }
   };
+  return provider;
 }

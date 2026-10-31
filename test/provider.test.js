@@ -173,7 +173,7 @@ test('reply fixes channel, disables mentions and maps stable idempotency to nonc
   assert.deepEqual(sent.allowed_mentions,{parse:[],replied_user:false});
   assert.equal(sent.message_reference.channel_id,'2000');
   await assert.rejects(provider.sendReply({message:{...received,conversationId:'2001'},text:'answer',idempotencyKey:'fixed-key'}),/binding/);
-  await assert.rejects(provider.sendReply({message:received,text:'x'.repeat(2001),idempotencyKey:'fixed-key'}),/2000/);
+  await assert.rejects(provider.sendReply({message:received,text:'x'.repeat(20001),idempotencyKey:'fixed-key'}),/20,000/);
   assert.equal(fx.calls.filter(c=>c.body).length,1);
 });
 
