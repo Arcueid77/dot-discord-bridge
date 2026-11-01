@@ -2,6 +2,11 @@
 
 在你与 Discord bot 的私聊里使用原来的 ChatGPT dot。这个仓库负责 Discord 收发；安装、MCP Tunnel 和多渠道管理由 [DotBridge 总仓库](https://github.com/Arcueid77/dot-bridge) 提供。
 
+
+可以让 dot 把收到的图片、语音或文件直接发回原私聊，例如“把这张图发回来”。桥会按附件编号读取，不需要来回传递很长的编码文本。仍需符合本渠道的格式和大小限制；无法作为语音发送的已识别音频，可以明确选择作为文件回复。
+
+TXT、Markdown、JSON、CSV 等文本附件会提供可读的文字摘录，支持 UTF-8 和带标记的 UTF-16；过长时明确标记为截断，原文件仍可读取。其他格式继续保留原件。
+
 ## 使用前准备
 
 需要 Node.js 24.15 以上、25 以下，以及一个你有权使用的 Discord bot。
