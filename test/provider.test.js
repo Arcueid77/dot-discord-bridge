@@ -44,6 +44,15 @@ function ready(socket){
 }
 const message=(id='3000',text='hello')=>({id,channel_id:'2000',type:0,author:{id:'1000',bot:false},content:text,timestamp:'2026-10-19T00:00:00Z',attachments:[]});
 
+test('proactive Discord messages keep the verified owner DM, suppress mentions and use a stable nonce without a source reference',async t=>{
+  const fx=fixture(),provider=createProvider({...fx,credentials,state:memory(),random:()=>1,onMessage:async()=>{}});t.after(()=>provider.stop());
+  await provider.start();ready(fx.sockets[0]);await until(()=>provider.status().connected);
+  await provider.sendOwnerMessage({text:'fixture notification @everyone',idempotencyKey:'fixture-occurrence',authorize:()=>{}});
+  const body=fx.calls.findLast(c=>c.path==='/api/v10/channels/2000/messages').body;
+  assert.equal(body.content,'fixture notification @everyone');assert.equal(body.enforce_nonce,true);assert.equal(body.nonce.length,24);assert.deepEqual(body.allowed_mentions.parse,[]);assert.equal(Object.hasOwn(body,'message_reference'),false);
+  const before=fx.calls.length;await assert.rejects(provider.sendOwnerMessage({text:'blocked',idempotencyKey:'other',authorize:()=>{throw Error('revoked');}}));assert.equal(fx.calls.length,before);
+});
+
 test('checks private channel and identifies with direct-message intent only',async t=>{
   const fx=fixture();
   const state=memory();

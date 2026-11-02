@@ -388,6 +388,14 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
       await Promise.allSettled([...requests]);
     },
     status() { return {connected, running, blocked}; },
+    async sendOwnerMessage({text, idempotencyKey, authorize}) {
+      if (!running || controller.signal.aborted || typeof text !== 'string' || !text.trim() || !text.isWellFormed() || text.length > 2000) throw fail();
+      const nonce = createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 24);
+      authorize();
+      const sent = await request(`/channels/${conversationId}/messages`, {content:text, allowed_mentions:{parse:[], users:[], roles:[], replied_user:false}, nonce, enforce_nonce:true});
+      if (!snowflake(sent?.id) || sent.channel_id !== conversationId) throw fail();
+      return {};
+    },
     validateMediaReply,
     async readAttachment({message, attachmentIndex}) {
       binding(message);

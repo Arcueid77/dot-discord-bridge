@@ -58,3 +58,9 @@ node --env-file=/etc/dot-bridge/discord/discord.env scripts/run-live.js --confir
 - [Discord Gateway 与 intent](https://docs.discord.com/developers/events/gateway)
 - [发送消息与 nonce](https://docs.discord.com/developers/resources/message#create-message)
 - [DotBridge 统一安装与运行](https://github.com/Arcueid77/dot-bridge)
+
+## 定时消息
+
+新增主动文字和固定提醒：目标只允许已绑定的本人私聊，主动发送默认关闭。管理员批准后可设置 `DOT_BRIDGE_OUTBOUND=owner-text`；原 dot 通过发送、保存提醒、查询、修改和取消工具管理，不需要重建事件订阅。每条最多 2,000 字符，重复提醒需有结束日期。
+
+详见[定时消息使用指南](https://github.com/Arcueid77/dot-bridge/blob/dev/unified-distribution/docs/scheduled-messages.md)。
