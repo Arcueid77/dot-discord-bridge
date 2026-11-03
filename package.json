@@ -1,6 +1,6 @@
 {
   "name": "dot-discord-bridge",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -22,7 +22,8 @@
     "vendor/",
     "docs/",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "README.en.md"
   ],
   "scripts": {
     "check": "node scripts/check.js",
@@ -30,6 +31,6 @@
   },
   "dependencies": {
     "ws": "8.22.0",
-    "@dot-bridge/core": "file:vendor/dot-bridge-core-0.10.0.tgz"
+    "@dot-bridge/core": "file:vendor/dot-bridge-core-0.11.0.tgz"
   }
 }

@@ -1,6 +1,6 @@
 {
   "package": "@dot-bridge/core",
-  "version": "0.10.0",
-  "source_revision": "05913502c15ac7e266b942affb04b2b3ca5a05a2",
-  "sha256": "56f61c4e6173d54895905f170688ddcde7cb62cf969784b054c2695ba65d1202"
+  "version": "0.11.0",
+  "source_revision": "7b3db30814f19209181ebbdab2a05151eabcfec5",
+  "sha256": "54a808c60bc670257719290cebf2fe93fe3dca3e674a6edca2549f295912caaa"
 }

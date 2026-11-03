@@ -1,6 +1,8 @@
 import {createHash} from 'node:crypto';
 import WebSocketClient from 'ws';
 import {channel} from './channel.js';
+import {conversationRoute,interactionPolicy} from '@dot-bridge/core/channels/experience-policy.js';
+import {clipText,splitMarkdown} from '@dot-bridge/core/channels/formatting.js';
 import {MAX_MEDIA_BYTES as MAX_MEDIA} from '@dot-bridge/core/channels/media.js';
 
 const API = 'https://discord.com/api/v10';
@@ -48,7 +50,9 @@ function gatewayUrl(value) {
 }
 
 async function json(response) {
-  if (!response.ok || response.redirected || !response.body) throw fail();
+  if(!response.ok||response.redirected)throw Object.assign(fail(),{rejected:response.status>=400&&response.status<500&&response.status!==429});
+  if(response.status===204)return {};
+  if(!response.body)throw fail();
   const reader = response.body.getReader();
   const chunks = [];
   let length = 0;
@@ -67,9 +71,12 @@ async function json(response) {
   }
 }
 
-export function createProvider({credentials, state, onMessage, signal, fetch = globalThis.fetch, WebSocket = WebSocketClient, random = Math.random, timing = {}}) {
+export function createProvider({credentials, interaction, state, onMessage, signal, fetch = globalThis.fetch, WebSocket = WebSocketClient, random = Math.random, timing = {}}) {
   const {botToken, ownerId, conversationId} = credentials ?? {};
   if (typeof botToken !== 'string' || !/^[A-Za-z0-9_.-]{20,256}$/.test(botToken) || !snowflake(ownerId) || !snowflake(conversationId)) throw new Error('Discord credentials require a bot token, owner user ID and private channel ID.');
+  const policy=interaction??interactionPolicy({},channel);
+  const groups=policy.groups.filter(group=>group.enabled),threadChannels=new Map();
+  const gatewayIntents=4096|(groups.length?512:0)|(groups.some(group=>group.autoReply!=='off')?32768:0);
   const controller = new AbortController();
   const requests = new Set();
   let running = false;
@@ -87,20 +94,20 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
   signal?.addEventListener('abort', abort, {once:true});
   if (signal?.aborted) controller.abort();
 
-  function request(path, payload) {
+  function request(path, payload, {method,timeout=15000}={}) {
     const task = (async () => {
       const deadline = new AbortController();
-      const timer = setTimeout(() => deadline.abort(), 15000);
+      const timer = setTimeout(() => deadline.abort(), timeout);
       timer.unref?.();
       try {
         const response = await fetch(`${API}${path}`, {
-          method:payload === undefined ? 'GET' : 'POST', redirect:'error',
+          method:method??(payload === undefined ? 'GET' : 'POST'), redirect:'error',
           headers:{authorization:`Bot ${botToken}`, ...(payload instanceof FormData ? {} : {'content-type':'application/json'}), 'user-agent':'DiscordBot (https://github.com/Arcueid77/dot-discord-bridge, 0.1.0)'},
           ...(payload === undefined ? {} : {body:payload instanceof FormData ? payload : JSON.stringify(payload)}),
           signal:AbortSignal.any([controller.signal, deadline.signal])
         });
         return await json(response);
-      } catch { throw fail(); }
+      } catch(error) { throw Object.assign(fail(),{rejected:error?.rejected===true}); }
       finally { clearTimeout(timer); deadline.abort(); }
     })();
     requests.add(task);
@@ -109,15 +116,18 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
   }
 
   function binding(message) {
-    if (!running || controller.signal.aborted) throw new Error('Discord provider is not running.');
-    if (message?.senderId !== ownerId || message?.conversationId !== conversationId || !snowflake(message.id) || message.replyContext?.messageId !== message.id) throw new Error('Discord reply binding is invalid.');
+    if(!running||controller.signal.aborted||!conversationRoute({channel,credentials,interaction:policy},message)||!snowflake(message.id)||message.replyContext?.messageId!==message.id)throw new Error('Discord reply binding is invalid.');
+    const target=message.replyContext.channelId??message.conversationId;
+    if(!snowflake(target)||target!==(message.threadId??message.conversationId))throw new Error('Discord reply binding is invalid.');
+    return target;
   }
+  function checkedMessage(value,target) {if(!snowflake(value?.id)||value.channel_id!==target)throw fail();return value;}
 
   function replyPayload(message, idempotencyKey, content) {
     if (typeof idempotencyKey !== 'string' || !idempotencyKey || idempotencyKey.length > 1024) throw new Error('Discord reply requires a stable idempotency key.');
     return {content, nonce:createHash('sha256').update(idempotencyKey).digest('hex').slice(0, 24), enforce_nonce:true,
       allowed_mentions:{parse:[], replied_user:false},
-      message_reference:{message_id:message.id, channel_id:conversationId, fail_if_not_exists:false}};
+      message_reference:{message_id:message.id, channel_id:binding(message), fail_if_not_exists:false}};
   }
 
   function download(url) {
@@ -166,11 +176,21 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
   function persist(sequence) {
     if (!resume || sequence < resume.sequence) return;
     resume.sequence = sequence;
-    state.set('gatewaySession', {...resume, botId:selfId, ownerId, conversationId});
+    state.set('gatewaySession', {...resume, botId:selfId, ownerId, conversationId, intents:gatewayIntents});
   }
 
   async function ingest(data) {
-    if (!data || data.guild_id || data.webhook_id || data.author?.bot || data.author?.system || data.author?.id !== ownerId || data.author.id === selfId || data.channel_id !== conversationId || ![0, 19].includes(data.type) || !snowflake(data.id)) return;
+    if (!data || data.webhook_id || data.author?.bot || data.author?.system || data.author?.id === selfId || !snowflake(data.author?.id) || !snowflake(data.channel_id) || ![0,19].includes(data.type) || !snowflake(data.id))return;
+    let sourceConversation=data.channel_id,threadId;
+    const chatType=data.guild_id?'group':'private';
+    if(chatType==='private'){if(data.author.id!==ownerId||data.channel_id!==conversationId)return;}else{
+      if(!snowflake(data.guild_id)||!groups.length)return;
+      if(!groups.some(group=>group.conversationId===sourceConversation)){
+        let info=threadChannels.get(data.channel_id);if(info===false)return;
+        if(!info){try{info=await request('/channels/'+data.channel_id);}catch(error){if(error.rejected){if(threadChannels.size>=1000)threadChannels.clear();threadChannels.set(data.channel_id,false);return;}throw error;}if(info?.id!==data.channel_id||![10,11,12].includes(info.type)||!snowflake(info.parent_id)||info.guild_id!==data.guild_id){if(threadChannels.size>=1000)threadChannels.clear();threadChannels.set(data.channel_id,false);return;}if(threadChannels.size>=1000)threadChannels.clear();threadChannels.set(data.channel_id,info);}
+        if(!groups.some(group=>group.conversationId===info.parent_id))return;sourceConversation=info.parent_id;threadId=data.channel_id;
+      }
+    }
     const text = typeof data.content === 'string' ? data.content : '';
     if (text.length > 20000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]|\p{Surrogate}/u.test(text)) return;
     const attachments = Array.isArray(data.attachments) ? data.attachments.slice(0, 10).map(value => {
@@ -183,7 +203,9 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
     }) : [];
     const references = Array.isArray(data.attachments) ? data.attachments.slice(0, 10).map(value => snowflake(value?.id) ? {id:value.id, ...(Number.isSafeInteger(value.size) && value.size >= 0 ? {size:value.size} : {})} : null) : [];
     if (!text && !attachments.length) return;
-    const message = {id:data.id, senderId:ownerId, conversationId, text, replyContext:{messageId:data.id, attachments:references}, attachments};
+    const message={id:data.id,senderId:data.author.id,conversationId:sourceConversation,chatType,text,botMentioned:Array.isArray(data.mentions)&&data.mentions.some(user=>user?.id===selfId)||data.referenced_message?.channel_id===data.channel_id&&data.referenced_message?.author?.id===selfId,forwarded:Array.isArray(data.message_snapshots)&&data.message_snapshots.length>0,...(threadId?{threadId}:{}),replyContext:{messageId:data.id,channelId:data.channel_id,...(data.guild_id?{guildId:data.guild_id}:{}),attachments:references},attachments};
+    if(!conversationRoute({channel,credentials,interaction:policy},message))return;
+    const quoted=data.referenced_message;if(quoted?.channel_id===data.channel_id&&typeof quoted.content==='string'&&quoted.content)message.quote={text:clipText(quoted.content.toWellFormed(),4000),truncated:quoted.content.length>4000};
     const timestamp = typeof data.timestamp === 'string' ? Date.parse(data.timestamp) : NaN;
     if (Number.isFinite(timestamp) && timestamp > 0) message.timestamp = timestamp;
     await onMessage(message);
@@ -292,7 +314,7 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
                 remainingIdentifies--;
                 lastIdentifyAt = Date.now();
                 state.set('gatewayIdentifyAt', lastIdentifyAt);
-                send(2, {token:botToken, intents:4096, properties:{os:process.platform, browser:'dot-bridge', device:'dot-bridge'}});
+                send(2, {token:botToken, intents:gatewayIntents, properties:{os:process.platform, browser:'dot-bridge', device:'dot-bridge'}});
               } catch { disconnect(); }
             }, Math.max(0, 5000 - (Date.now() - lastIdentifyAt)));
           } else if (frame.op === 11) awaitingAck = false;
@@ -371,7 +393,7 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
         if (prior !== undefined) {
           if (prior?.botId !== selfId || prior?.ownerId !== ownerId || prior?.conversationId !== conversationId || typeof prior.sessionId !== 'string' || !prior.sessionId || prior.sessionId.length > 512 || !Number.isSafeInteger(prior.sequence) || prior.sequence < 0) throw fail();
           gatewayUrl(prior.gatewayUrl);
-          resume = {...prior};
+          if((prior.intents??4096)===gatewayIntents)resume={...prior};else clearSession();
         }
         if (!resume && remainingIdentifies === 0) throw fail();
         if (controller.signal.aborted) throw fail();
@@ -396,6 +418,18 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
       if (!snowflake(sent?.id) || sent.channel_id !== conversationId) throw fail();
       return {};
     },
+    async setFeedback({message,active,authorize}) {const target=binding(message);authorize();await request('/channels/'+target+'/messages/'+message.id+'/reactions/'+encodeURIComponent('👀')+'/@me',undefined,{method:active?'PUT':'DELETE',timeout:5000});return null;},
+    async setTyping({message,active,authorize}) {const target=binding(message);if(!active)return;authorize();await request('/channels/'+target+'/typing',{}, {timeout:5000});},
+    canProgressFinal({text}) {return text.length<=channel.nativeMaxReplyText;},
+    async sendProgress({message,text,reference,final=false,idempotencyKey,authorize}) {
+      const target=binding(message);if(!final&&text.length>1900)text=clipText(text,1850)+'\n…（完整回答将在完成后发送 / full answer follows）';
+      if(text.length>channel.nativeMaxReplyText)throw new Error('Native progress text exceeds its limit');authorize();
+      if(reference){if(reference.conversationId!==target||!snowflake(reference.id))throw fail();checkedMessage(await request('/channels/'+target+'/messages/'+reference.id,{content:text,allowed_mentions:{parse:[],replied_user:false}},{method:'PATCH'}),target);return reference;}
+      const sent=checkedMessage(await request('/channels/'+target+'/messages',replyPayload(message,idempotencyKey,text)),target);return {id:sent.id,conversationId:target};
+    },
+    async finishProgress({message,reference,cancelled,authorize}) {if(!cancelled)return;const target=binding(message);if(reference.conversationId!==target||!snowflake(reference.id))throw fail();authorize();await request('/channels/'+target+'/messages/'+reference.id,undefined,{method:'DELETE'});},
+    planTextReply(text) {return splitMarkdown(text,1900).map(text=>({text,format:'text'}));},
+    async sendTextPart({message,text,idempotencyKey,authorize}) {const target=binding(message);if(text.length>2000)throw fail();authorize();const sent=checkedMessage(await request('/channels/'+target+'/messages',replyPayload(message,idempotencyKey,text)),target);return {providerMessageId:sent.id};},
     validateMediaReply,
     async readAttachment({message, attachmentIndex}) {
       binding(message);
@@ -404,11 +438,12 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
       const item = message.attachments[attachmentIndex];
       if (!snowflake(ref?.id) || !['image', 'audio', 'file'].includes(item.kind) || (ref.size !== undefined && (!Number.isSafeInteger(ref.size) || ref.size < 0 || ref.size > MAX_MEDIA))) throw new Error('Discord attachment is unavailable or exceeds 5 MiB.');
       // Refresh this original private message to obtain a current signed CDN URL.
-      const current = await request(`/channels/${conversationId}/messages/${message.id}`);
-      if (current?.id !== message.id || current.channel_id !== conversationId || current.guild_id || current.webhook_id || current.author?.id !== ownerId || current.author?.bot || current.author?.system || !Array.isArray(current.attachments)) throw fail();
+      const target=binding(message);
+      const current = await request(`/channels/${target}/messages/${message.id}`);
+      if (current?.id !== message.id || current.channel_id !== target || (current.guild_id??null)!==(message.replyContext.guildId??null) || current.webhook_id || current.author?.id !== message.senderId || current.author?.bot || current.author?.system || !Array.isArray(current.attachments)) throw fail();
       const file = current.attachments.find(value => value?.id === ref.id);
       if (!file || !Number.isSafeInteger(file.size) || file.size < 1 || file.size > MAX_MEDIA) throw fail();
-      const result = await download(attachmentUrl(file.url, conversationId, ref.id));
+      const result = await download(attachmentUrl(file.url, target, ref.id));
       return {...result, mimeType:mime(result.mimeType) && result.mimeType !== 'application/octet-stream' ? result.mimeType : mime(file.content_type) ? file.content_type : 'application/octet-stream', ...(item.name ? {name:item.name} : {})};
     },
     async sendMediaReply({message, media, text = '', idempotencyKey, authorize = () => {}}) {
@@ -420,8 +455,8 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
       form.set('payload_json', JSON.stringify(payload));
       form.set('files[0]', new Blob([media.data], {type:media.mimeType}), media.name);
       authorize();
-      const sent = await request(`/channels/${conversationId}/messages`, form);
-      if (!snowflake(sent?.id) || sent.channel_id !== conversationId) throw fail();
+      const sent = await request(`/channels/${binding(message)}/messages`, form);
+      if (!snowflake(sent?.id) || sent.channel_id !== binding(message)) throw fail();
       return {providerMessageId:sent.id};
     },
     async sendReply({message, text, idempotencyKey, authorize = () => {}}) {
@@ -433,8 +468,8 @@ export function createProvider({credentials, state, onMessage, signal, fetch = g
         finally { data.fill(0); }
       }
       authorize();
-      const sent = await request(`/channels/${conversationId}/messages`, replyPayload(message, idempotencyKey, text));
-      if (!snowflake(sent?.id) || sent.channel_id !== conversationId) throw fail();
+      const sent = await request(`/channels/${binding(message)}/messages`, replyPayload(message, idempotencyKey, text));
+      if (!snowflake(sent?.id) || sent.channel_id !== binding(message)) throw fail();
       return {providerMessageId:sent.id};
     }
   };

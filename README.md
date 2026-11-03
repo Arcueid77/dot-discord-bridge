@@ -1,5 +1,7 @@
 # dot-discord-bridge
 
+[English](README.en.md)
+
 在你与 Discord bot 的私聊里使用原来的 ChatGPT dot。这个仓库负责 Discord 收发；安装、MCP Tunnel 和多渠道管理由 [DotBridge 总仓库](https://github.com/Arcueid77/dot-bridge) 提供。
 
 
@@ -44,7 +46,7 @@ node --env-file=/etc/dot-bridge/discord/discord.env scripts/run-live.js --confir
 - 可读取私聊中的图片、语音和文件，也可回复图片、音频或文件；每个附件最多 5 MiB，可附带 2000 字符以内的说明。
 - 图片支持 JPEG、PNG、GIF、WebP。音频作为可下载的音频附件发送，不生成 Discord 原生语音便笺的波形界面。
 - 语音转写由共享 core 中已配置的本地转写程序处理。未配置时仍可取得音频文件，但不会自动获得转写文字。
-- 仅接收绑定用户在指定私聊里的新消息。群聊、服务器频道、机器人消息、消息编辑和互动命令不进入 dot。
+- 默认只接收绑定用户的指定私聊；服务器频道与论坛线程需显式配置受保护规则。机器人、消息编辑和应用互动命令仍不进入 dot；本人管理使用文本命令。
 - 断线会自动重连，并在 Discord 仍允许恢复会话时接续事件。会话失效后不会回补离线历史；需要时请重新发送消息。
 - 发送结果不明确时不会自动重发。Discord 的 nonce 去重只在平台规定的短时间内有效。
 - 升级前已保存的附件缺少文件引用，读取时需要在原私聊重新发送。原消息被删除、附件移除或超过大小限制时，会明确报告附件不可用。
@@ -63,4 +65,7 @@ node --env-file=/etc/dot-bridge/discord/discord.env scripts/run-live.js --confir
 
 新增主动文字和固定提醒：目标只允许已绑定的本人私聊，主动发送默认关闭。管理员批准后可设置 `DOT_BRIDGE_OUTBOUND=owner-text`；原 dot 通过发送、保存提醒、查询、修改和取消工具管理，不需要重建事件订阅。每条最多 2,000 字符，重复提醒需有结束日期。
 
-详见[定时消息使用指南](https://github.com/Arcueid77/dot-bridge/blob/dev/unified-distribution/docs/scheduled-messages.md)。
+详见[定时消息使用指南](https://github.com/Arcueid77/dot-bridge/blob/main/docs/scheduled-messages.md)。
+
+
+新增统一交互：受保护策略文件控制处理提示、近期上下文及聊天内管理。Telegram／Discord 另有真正增量编辑和按群／话题规则；新群默认关闭。配置见[统一交互说明](https://github.com/Arcueid77/dot-bridge/blob/main/docs/new-channels.md#统一交互与群聊规则)。

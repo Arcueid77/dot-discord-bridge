@@ -4,6 +4,8 @@ import {setTimeout as delay} from 'node:timers/promises';
 import {once} from 'node:events';
 import WebSocketClient,{WebSocketServer} from 'ws';
 import {createProvider} from '../src/provider.js';
+import {interactionPolicy} from '@dot-bridge/core/channels/experience-policy.js';
+import {channel} from '../src/channel.js';
 
 const credentials={botToken:'synthetic.bot.token.abcdefghijklmnop',ownerId:'1000',conversationId:'2000'};
 function memory() { const data=new Map(); return {get:k=>data.get(k),set:(k,v)=>data.set(k,structuredClone(v)),delete:k=>data.delete(k)}; }
@@ -28,11 +30,12 @@ function fixture(options={}) {
     assert.equal(init.redirect,'error');
     const path=new URL(url).pathname;
     const body=init.body?JSON.parse(init.body):undefined;
-    calls.push({path,body});
+    calls.push({path,body,method:init.method});
     if(path==='/api/v10/users/@me')return response({id:'9000',bot:true});
     if(path==='/api/v10/channels/2000')return response(options.channel??{id:'2000',type:1,recipients:[{id:'1000',bot:false}]});
     if(path==='/api/v10/gateway/bot')return response(options.gateway??{url:'wss://gateway.discord.gg'});
     if(path==='/api/v10/channels/2000/messages')return options.send?options.send(body,init.signal):response({id:'8000',channel_id:'2000'});
+    if(options.extra){const result=await options.extra(path,body,init);if(result)return result;}
     throw new Error('unexpected endpoint');
   };
   return {WebSocket:Socket,fetch,sockets,calls};
@@ -291,4 +294,52 @@ test('real ws parser rejects an over-limit wire message before application dispa
   await until(()=>closes.length===1);
   assert.equal(wireClients[0].readyState,3);
   assert.deepEqual(transportErrors,['WS_ERR_UNSUPPORTED_MESSAGE_LENGTH']);
+});
+
+
+test('configured guilds require actual mentions and preserve each forum topic target and quote',async t=>{
+  const fx=fixture({extra:async(path,body)=>{
+    if(path==='/api/v10/channels/7000')return response({id:'7000',type:11,parent_id:'5000',guild_id:'6000'});
+    if(path==='/api/v10/channels/7000/messages')return response({id:'8001',channel_id:'7000'});
+    if(path==='/api/v10/channels/9999')return response({id:'9999',type:0,guild_id:'6000'});
+  }}),seen=[],state=memory();
+  const interaction=interactionPolicy({groups:[{conversation_id:'5000',members:'all'}]},channel);
+  const provider=createProvider({...fx,credentials,interaction,state,random:()=>1,onMessage:async value=>seen.push(value)});t.after(()=>provider.stop());
+  await provider.start();const ws=fx.sockets[0];ready(ws);await until(()=>provider.status().connected&&ws.sent.some(value=>value.op===2));assert.equal(ws.sent.find(value=>value.op===2).d.intents,4608);
+  const group=(id,other={})=>({...message(id),guild_id:'6000',channel_id:'5000',author:{id:'4000',bot:false},mentions:[],...other});
+  ws.frame({op:0,t:'MESSAGE_CREATE',s:2,d:group('3001',{content:'<@9000> plain spoof'})});
+  ws.frame({op:0,t:'MESSAGE_CREATE',s:3,d:group('3002',{mentions:[{id:'9000'}]})});
+  ws.frame({op:0,t:'MESSAGE_CREATE',s:4,d:group('3003',{channel_id:'7000',mentions:[{id:'9000'}],referenced_message:{channel_id:'7000',content:'topic quote',author:{id:'5001'}}})});
+  ws.frame({op:0,t:'MESSAGE_CREATE',s:5,d:group('3004',{channel_id:'9999',mentions:[{id:'9000'}]})});
+  await until(()=>state.get('gatewaySession').sequence===5);assert.deepEqual(seen.map(value=>value.id),['3002','3003']);assert.equal(seen[1].conversationId,'5000');assert.equal(seen[1].threadId,'7000');assert.equal(seen[1].quote.text,'topic quote');
+  await provider.sendReply({message:seen[1],text:'topic answer',idempotencyKey:'topic-final',authorize:()=>{}});
+  const final=fx.calls.findLast(value=>value.path==='/api/v10/channels/7000/messages');assert.equal(final.body.message_reference.message_id,'3003');assert.equal(final.body.message_reference.channel_id,'7000');assert.deepEqual(final.body.allowed_mentions.parse,[]);
+});
+
+test('keyword and all-message group modes request message-content intent without widening owner DMs',async t=>{
+  const fx=fixture(),seen=[],state=memory(),interaction=interactionPolicy({groups:[{conversation_id:'5000',members:'allowlist',allow_from:['4000'],mention:false,auto_reply:'keywords',keywords:['please']}]},channel);
+  const provider=createProvider({...fx,credentials,interaction,state,random:()=>1,onMessage:async value=>seen.push(value)});t.after(()=>provider.stop());await provider.start();const ws=fx.sockets[0];ready(ws);await until(()=>ws.sent.some(value=>value.op===2));assert.equal(ws.sent.find(value=>value.op===2).d.intents,37376);
+  ws.frame({op:0,t:'MESSAGE_CREATE',s:2,d:{...message('3001','please help'),guild_id:'6000',channel_id:'5000',author:{id:'4000',bot:false},mentions:[]}});
+  ws.frame({op:0,t:'MESSAGE_CREATE',s:3,d:{...message('3002','please help'),guild_id:'6000',channel_id:'5000',author:{id:'4001',bot:false},mentions:[]}});
+  ws.frame({op:0,t:'MESSAGE_CREATE',s:4,d:{...message('3003'),author:{id:'4000',bot:false}}});await until(()=>state.get('gatewaySession').sequence===4);assert.deepEqual(seen.map(value=>value.id),['3001']);
+});
+
+test('native reactions, typing and progressive edits keep one acknowledged message and suppress mentions',async t=>{
+  const fx=fixture({extra:async(path,body,init)=>{
+    if(path.includes('/reactions/')||path.endsWith('/typing')||init.method==='DELETE')return new Response(null,{status:204});
+    if(path==='/api/v10/channels/2000/messages/8000'&&init.method==='PATCH')return response({id:'8000',channel_id:'2000'});
+  }}),seen=[];const provider=createProvider({...fx,credentials,state:memory(),random:()=>1,onMessage:async value=>seen.push(value)});t.after(()=>provider.stop());await provider.start();const ws=fx.sockets[0];ready(ws);await until(()=>provider.status().connected);ws.frame({op:0,t:'MESSAGE_CREATE',s:2,d:message()});await until(()=>seen.length===1);
+  const original=seen[0];await provider.setFeedback({message:original,active:true,authorize:()=>{}});await provider.setTyping({message:original,active:true,authorize:()=>{}});
+  const reference=await provider.sendProgress({message:original,text:'first',idempotencyKey:'progress',authorize:()=>{}});await provider.sendProgress({message:original,text:'first and final',reference,final:true,idempotencyKey:'final',authorize:()=>{}});
+  assert.equal(fx.calls.filter(value=>value.path==='/api/v10/channels/2000/messages').length,1);assert.equal(fx.calls.filter(value=>value.method==='PATCH').length,1);assert.deepEqual(fx.calls.find(value=>value.method==='PATCH').body.allowed_mentions.parse,[]);
+  const before=fx.calls.length;await assert.rejects(provider.sendProgress({message:original,text:'wrong',reference:{...reference,conversationId:'other'},authorize:()=>{}}));assert.equal(fx.calls.length,before);
+});
+
+
+test('denied unrelated thread lookup cannot poison the gateway cursor or owner DM processing',async t=>{
+ const fx=fixture({extra:async path=>path==='/api/v10/channels/9999'?new Response('{}',{status:403}):undefined}),state=memory(),seen=[],interaction=interactionPolicy({groups:[{conversation_id:'5000',members:'all'}]},channel);
+ const provider=createProvider({...fx,credentials,interaction,state,random:()=>1,onMessage:async value=>seen.push(value)});t.after(()=>provider.stop());await provider.start();const ws=fx.sockets[0];ready(ws);await until(()=>provider.status().connected);
+ const ignored=id=>({...message(id),guild_id:'6000',channel_id:'9999',author:{id:'4000',bot:false},mentions:[{id:'9000'}]});
+ ws.frame({op:0,t:'MESSAGE_CREATE',s:2,d:ignored('3001')});ws.frame({op:0,t:'MESSAGE_CREATE',s:3,d:ignored('3002')});ws.frame({op:0,t:'MESSAGE_CREATE',s:4,d:message('3003')});await until(()=>state.get('gatewaySession').sequence===4);
+ assert.deepEqual(seen.map(value=>value.id),['3003']);assert.equal(fx.calls.filter(value=>value.path==='/api/v10/channels/9999').length,1);assert.equal(fx.sockets.length,1);
 });
