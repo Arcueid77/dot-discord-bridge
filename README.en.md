@@ -85,3 +85,9 @@ See [shared interaction configuration](https://github.com/Arcueid77/dot-bridge/b
 ## Owner reminders
 
 Explicit `DOT_BRIDGE_OUTBOUND=owner-text` enables owner-only text and fixed reminders, at most 2,000 characters each. Recurring reminders require an end date. Reuse the existing task and inspect stored outcomes. See [scheduled messages](https://github.com/Arcueid77/dot-bridge/blob/main/docs/scheduled-messages.en.md).
+
+## Choices, uploads and reminder management
+
+Native choices become one new input for the original dot. They bind to the requesting actor, conversation and acknowledged prompt message for up to ten minutes. A dot environment with programmatic file access can upload generated media in bounded encrypted chunks, verify its size and SHA-256, then submit the source-bound final reply. Files are limited to 5 MiB and this provider's supported media types and formats.
+
+Literal reminders support weekdays, fixed intervals, pause, resume and delivery history. Check `check_discord_outbound` before use and supply the saved reminder ID and current revision. Resuming skips old paused occurrences.

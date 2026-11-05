@@ -72,6 +72,18 @@ test('checks private channel and identifies with direct-message intent only',asy
   assert.deepEqual(fx.calls.map(c=>c.path),['/api/v10/users/@me','/api/v10/channels/2000','/api/v10/gateway/bot']);
 });
 
+test('Discord choices use native select components and authenticated interaction callbacks',async t=>{
+ const fx=fixture(),selected=[],acks=[],token='db_'+'a'.repeat(24);
+ const provider=createProvider({...fx,credentials,state:memory(),random:()=>1,onMessage:async()=>{},onChoice:async input=>{selected.push(input);return {accepted:true,label:'PDF'};},fetch:async(url,init)=>{
+  if(new URL(url).pathname.startsWith('/api/v10/interactions/')){acks.push(JSON.parse(init.body));return new Response(null,{status:204});}
+  return fx.fetch(url,init);
+ }});t.after(()=>provider.stop());await provider.start();ready(fx.sockets[0]);await until(()=>provider.status().connected);
+ await provider.sendChoiceReply({message:{id:'3000',senderId:'1000',conversationId:'2000',replyContext:{messageId:'3000',channelId:'2000'}},text:'Choose',choices:[{label:'PDF',token}],presentation:'select',idempotencyKey:'native-choices',authorize:()=>{}});
+ const sent=fx.calls.findLast(v=>v.path==='/api/v10/channels/2000/messages');assert.equal(sent.body.components[0].components[0].type,3);assert.equal(sent.body.components[0].components[0].options[0].value,token);
+ fx.sockets[0].frame({op:0,t:'INTERACTION_CREATE',s:2,d:{id:'7000',type:3,token:'synthetic.interaction.token',channel_id:'2000',user:{id:'1000'},message:{id:'8000',author:{id:'9000',bot:true}},data:{component_type:3,values:[token]}}});
+ await until(()=>selected.length===1&&acks.length===1);assert.equal(selected[0].message.id,'8000');assert.equal(selected[0].message.replyContext.channelId,'2000');assert.equal(acks[0].type,6);
+});
+
 test('waits for ingestion before durable sequence; filters guild, bot and non-owner events',async t=>{
   const fx=fixture();
   const state=memory();

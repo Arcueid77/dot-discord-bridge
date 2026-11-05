@@ -71,7 +71,7 @@ async function json(response) {
   }
 }
 
-export function createProvider({credentials, interaction, state, onMessage, signal, fetch = globalThis.fetch, WebSocket = WebSocketClient, random = Math.random, timing = {}}) {
+export function createProvider({credentials, interaction, state, onMessage, onChoice, signal, fetch = globalThis.fetch, WebSocket = WebSocketClient, random = Math.random, timing = {}}) {
   const {botToken, ownerId, conversationId} = credentials ?? {};
   if (typeof botToken !== 'string' || !/^[A-Za-z0-9_.-]{20,256}$/.test(botToken) || !snowflake(ownerId) || !snowflake(conversationId)) throw new Error('Discord credentials require a bot token, owner user ID and private channel ID.');
   const policy=interaction??interactionPolicy({},channel);
@@ -211,6 +211,22 @@ export function createProvider({credentials, interaction, state, onMessage, sign
     await onMessage(message);
   }
 
+  async function choiceInteraction(data) {
+    const user=data?.member?.user??data?.user;
+    const token=data?.data?.component_type===3?data.data.values?.[0]:data?.data?.custom_id;
+    if(typeof onChoice!=='function'||data?.type!==3||!snowflake(data.id)||!snowflake(user?.id)||user.bot||!snowflake(data.channel_id)||!snowflake(data.message?.id)||data.message.author?.id!==selfId||typeof token!=='string'||!/^db_[A-Za-z0-9_-]{24}$/.test(token)||typeof data.token!=='string'||!/^[A-Za-z0-9_.-]{1,512}$/.test(data.token))return;
+    let sourceConversation=data.channel_id,threadId;
+    if(data.guild_id&&!groups.some(group=>group.conversationId===sourceConversation)){
+      const info=threadChannels.get(data.channel_id)??await request('/channels/'+data.channel_id);
+      if(!info||![10,11,12].includes(info.type)||info.guild_id!==data.guild_id||!groups.some(group=>group.conversationId===info.parent_id))return;
+      sourceConversation=info.parent_id;threadId=data.channel_id;
+    }
+    const message={id:data.message.id,senderId:user.id,conversationId:sourceConversation,botMentioned:true,text:'',...(threadId?{threadId}:{}),replyContext:{messageId:data.message.id,channelId:data.channel_id,...(data.guild_id?{guildId:data.guild_id}:{})},attachments:[]};
+    const result=await onChoice({token,senderId:user.id,conversationId:sourceConversation,threadId:message.threadId,message});
+    await request('/interactions/'+data.id+'/'+encodeURIComponent(data.token)+'/callback',{type:6},{timeout:2500});
+    return result;
+  }
+
   function connect() {
     return new Promise(resolve => {
       const ws = new WebSocket(gatewayUrl(resume?.gatewayUrl ?? initialGateway), {
@@ -339,6 +355,9 @@ export function createProvider({credentials, interaction, state, onMessage, sign
               } else if (frame.t === 'MESSAGE_CREATE') {
                 if (!resume) throw fail();
                 await ingest(frame.d);
+              } else if(frame.t==='INTERACTION_CREATE'){
+                if(!resume)throw fail();
+                await choiceInteraction(frame.d);
               }
               persist(frame.s);
             }).catch(() => { disconnect(); }).finally(() => { queued--; });
@@ -421,6 +440,24 @@ export function createProvider({credentials, interaction, state, onMessage, sign
     async setFeedback({message,active,authorize}) {const target=binding(message);authorize();await request('/channels/'+target+'/messages/'+message.id+'/reactions/'+encodeURIComponent('👀')+'/@me',undefined,{method:active?'PUT':'DELETE',timeout:5000});return null;},
     async setTyping({message,active,authorize}) {const target=binding(message);if(!active)return;authorize();await request('/channels/'+target+'/typing',{}, {timeout:5000});},
     canProgressFinal({text}) {return text.length<=channel.nativeMaxReplyText;},
+    async sendChoiceReply({message,text,choices,presentation,reference,idempotencyKey,authorize}) {
+      const target=binding(message);
+      let components;
+      if(presentation==='select')components=[{type:1,components:[{type:3,custom_id:'dotbridge_select',min_values:1,max_values:1,placeholder:'选择一个选项',options:choices.map(choice=>({label:choice.label,value:choice.token}))}]}];
+      else{
+        components=[];
+        for(let index=0;index<choices.length;index+=5)components.push({type:1,components:choices.slice(index,index+5).map(choice=>({type:2,style:1,label:choice.label,custom_id:choice.token}))});
+      }
+      const payload={...replyPayload(message,idempotencyKey,text),components};
+      authorize();
+      if(reference){
+        if(reference.conversationId!==target||!snowflake(reference.id))throw fail();
+        checkedMessage(await request('/channels/'+target+'/messages/'+reference.id,{content:text,components,allowed_mentions:{parse:[],replied_user:false}},{method:'PATCH'}),target);
+        return reference;
+      }
+      const sent=checkedMessage(await request('/channels/'+target+'/messages',payload),target);
+      return {id:sent.id,conversationId:target};
+    },
     async sendProgress({message,text,reference,final=false,idempotencyKey,authorize}) {
       const target=binding(message);if(!final&&text.length>1900)text=clipText(text,1850)+'\n…（完整回答将在完成后发送 / full answer follows）';
       if(text.length>channel.nativeMaxReplyText)throw new Error('Native progress text exceeds its limit');authorize();

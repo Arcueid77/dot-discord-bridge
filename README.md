@@ -116,3 +116,9 @@ node --env-file=/etc/dot-bridge/discord/discord.env scripts/run-live.js --confir
 Discord 的真实 @ 模式使用服务器消息 intent；关键词／全消息模式还需要 Message Content intent，并在官方后台明确启用。论坛规则填写父频道 ID，回复保留实际线程；已配置的普通频道也可直接使用频道 ID。回复抑制额外 mentions。
 
 配置字段的范围与私有文件要求见[统一交互说明](https://github.com/Arcueid77/dot-bridge/blob/main/docs/new-channels.md#统一交互与群聊规则)。
+
+## 选项、文件和提醒管理
+
+支持原生选项回复，点击后作为一条新输入交给原 dot。选项绑定发起人、原会话及实际发出的消息，最长十分钟有效。生成的图片、音频或文件可由具备程序文件读取能力的原 dot 分块上传，经大小与 SHA-256 校验后作为原消息的最终回复。单文件上限 5 MiB，仍需满足本渠道支持的媒体类型与格式。
+
+固定文字提醒支持工作日、固定间隔、暂停、恢复和发送历史。先核对 `check_discord_outbound` 的开关，再按提醒编号与当前版本操作。暂停期间的旧时间点在恢复时跳过。
