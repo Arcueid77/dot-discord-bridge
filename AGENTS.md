@@ -5,4 +5,5 @@ This repository owns one IM provider only. Shared MCP, encrypted state, callback
 - Use synthetic HTTP/WebSocket fixtures in ordinary tests. Never connect real accounts, generate persistent credentials or create callback subscriptions.
 - Never log raw provider events, messages, identities, secrets, full callback URLs or SDK errors.
 - User-facing docs explain configuration, use and limitations; put development evidence separately.
-- Use dev/ branches. Run npm run check and npm test for behavior changes.
+- Make small fixes, documentation updates and routine maintenance directly on `main`; do not create a branch by default. Reserve `dev/` branches for larger work that needs isolation.
+- Run npm run check and npm test for behavior changes.
