@@ -12,10 +12,12 @@ const fail = () => new Error('Discord transport failed.');
 const mime = value => typeof value === 'string' && /^[a-zA-Z0-9!#$&^_.+-]+\/[a-zA-Z0-9!#$&^_.+-]+$/.test(value) && value.length <= 127;
 
 function validateMediaReply({media, text = ''} = {}) {
-  if (!media || !['image', 'audio', 'file'].includes(media.type) || !Buffer.isBuffer(media.data) || media.data.length < 1 || media.data.length > MAX_MEDIA) throw new Error('Discord media must contain 1 byte to 5 MiB.');
+  if (!media || !channel.media.reply.includes(media.type) || !Buffer.isBuffer(media.data) || media.data.length < 1 || media.data.length > MAX_MEDIA) throw new Error('Discord media must contain 1 byte to 5 MiB.');
   if (!mime(media.mimeType) || typeof media.name !== 'string' || !media.name || media.name.length > 255 || /[\u0000-\u001f\u007f/\\]|\p{Surrogate}/u.test(media.name) || ['.', '..'].includes(media.name)) throw new Error('Discord media name or MIME type is invalid.');
   if (media.type === 'image' && !['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(media.mimeType)) throw new Error('Discord image replies require JPEG, PNG, GIF or WebP.');
   if (media.type === 'audio' && !['audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/wav', 'audio/webm', 'audio/flac'].includes(media.mimeType)) throw new Error('Discord audio format is unsupported; send it as a file.');
+  if (media.type === 'video' && !['video/mp4','video/webm','video/quicktime'].includes(media.mimeType)) throw new Error('Discord video format is unsupported.');
+  if (media.type === 'sticker' && !['image/png','image/apng','image/gif','image/webp'].includes(media.mimeType)) throw new Error('Discord sticker replies use an image attachment.');
   if (typeof text !== 'string' || text.length > 2000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]|\p{Surrogate}/u.test(text)) throw new Error('Discord media caption must contain at most 2000 characters.');
 }
 
@@ -71,7 +73,7 @@ async function json(response) {
   }
 }
 
-export function createProvider({credentials, interaction, state, onMessage, onChoice, signal, fetch = globalThis.fetch, WebSocket = WebSocketClient, random = Math.random, timing = {}}) {
+export function createProvider({credentials, interaction, nativeVoice = false, state, onMessage, onChoice, signal, fetch = globalThis.fetch, WebSocket = WebSocketClient, random = Math.random, timing = {}}) {
   const {botToken, ownerId, conversationId} = credentials ?? {};
   if (typeof botToken !== 'string' || !/^[A-Za-z0-9_.-]{20,256}$/.test(botToken) || !snowflake(ownerId) || !snowflake(conversationId)) throw new Error('Discord credentials require a bot token, owner user ID and private channel ID.');
   const policy=interaction??interactionPolicy({},channel);
@@ -202,6 +204,12 @@ export function createProvider({credentials, interaction, state, onMessage, onCh
       return item;
     }) : [];
     const references = Array.isArray(data.attachments) ? data.attachments.slice(0, 10).map(value => snowflake(value?.id) ? {id:value.id, ...(Number.isSafeInteger(value.size) && value.size >= 0 ? {size:value.size} : {})} : null) : [];
+    for (const sticker of Array.isArray(data.sticker_items) ? data.sticker_items.slice(0,3) : []) {
+      if (attachments.length >= 10 || !snowflake(sticker?.id) || ![1,2,4].includes(sticker.format_type)) continue;
+      const extension=sticker.format_type===4?'gif':'png';
+      attachments.push({kind:'sticker',mimeType:extension==='gif'?'image/gif':'image/png',name:'sticker.'+extension});
+      references.push({id:sticker.id,stickerFormat:sticker.format_type});
+    }
     if (!text && !attachments.length) return;
     const message={id:data.id,senderId:data.author.id,conversationId:sourceConversation,chatType,text,botMentioned:Array.isArray(data.mentions)&&data.mentions.some(user=>user?.id===selfId)||data.referenced_message?.channel_id===data.channel_id&&data.referenced_message?.author?.id===selfId,forwarded:Array.isArray(data.message_snapshots)&&data.message_snapshots.length>0,...(threadId?{threadId}:{}),replyContext:{messageId:data.id,channelId:data.channel_id,...(data.guild_id?{guildId:data.guild_id}:{}),attachments:references},attachments};
     if(!conversationRoute({channel,credentials,interaction:policy},message))return;
@@ -473,11 +481,19 @@ export function createProvider({credentials, interaction, state, onMessage, onCh
       if (!Number.isSafeInteger(attachmentIndex) || attachmentIndex < 0 || attachmentIndex >= (message.attachments?.length ?? 0) || attachmentIndex >= 10) throw new Error('Discord attachment is unavailable.');
       const ref = message.replyContext.attachments?.[attachmentIndex];
       const item = message.attachments[attachmentIndex];
-      if (!snowflake(ref?.id) || !['image', 'audio', 'file'].includes(item.kind) || (ref.size !== undefined && (!Number.isSafeInteger(ref.size) || ref.size < 0 || ref.size > MAX_MEDIA))) throw new Error('Discord attachment is unavailable or exceeds 5 MiB.');
+      if (!snowflake(ref?.id) || !channel.media.read.includes(item.kind) || (ref.size !== undefined && (!Number.isSafeInteger(ref.size) || ref.size < 0 || ref.size > MAX_MEDIA))) throw new Error('Discord attachment is unavailable or exceeds 5 MiB.');
       // Refresh this original private message to obtain a current signed CDN URL.
       const target=binding(message);
       const current = await request(`/channels/${target}/messages/${message.id}`);
-      if (current?.id !== message.id || current.channel_id !== target || (current.guild_id??null)!==(message.replyContext.guildId??null) || current.webhook_id || current.author?.id !== message.senderId || current.author?.bot || current.author?.system || !Array.isArray(current.attachments)) throw fail();
+      if (current?.id !== message.id || current.channel_id !== target || (current.guild_id??null)!==(message.replyContext.guildId??null) || current.webhook_id || current.author?.id !== message.senderId || current.author?.bot || current.author?.system) throw fail();
+      if (item.kind==='sticker') {
+        const sticker=current.sticker_items?.find(value=>value?.id===ref.id&&value.format_type===ref.stickerFormat);
+        if(!sticker||![1,2,4].includes(ref.stickerFormat))throw fail();
+        const gif=ref.stickerFormat===4;
+        const result=await download(gif?'https://media.discordapp.net/stickers/'+ref.id+'.gif':'https://cdn.discordapp.com/stickers/'+ref.id+'.png');
+        return {...result,mimeType:gif?'image/gif':'image/png',name:gif?'sticker.gif':'sticker.png'};
+      }
+      if(!Array.isArray(current.attachments))throw fail();
       const file = current.attachments.find(value => value?.id === ref.id);
       if (!file || !Number.isSafeInteger(file.size) || file.size < 1 || file.size > MAX_MEDIA) throw fail();
       const result = await download(attachmentUrl(file.url, target, ref.id));
@@ -488,6 +504,19 @@ export function createProvider({credentials, interaction, state, onMessage, onCh
       validateMediaReply({media, text});
       const payload = replyPayload(message, idempotencyKey, text);
       payload.attachments = [{id:0, filename:media.name}];
+      if (nativeVoice && media.type === 'audio' && media.mimeType === 'audio/ogg' && text === '' && media.voice) {
+        const voice=media.voice, waveform=Buffer.from(voice.waveform??'', 'base64');
+        if (!Number.isFinite(voice.durationSeconds) || voice.durationSeconds <= 0 || voice.durationSeconds > 120 ||
+            waveform.length < 1 || waveform.length > 256 || waveform.toString('base64') !== voice.waveform ||
+            voice.sha256 !== createHash('sha256').update(media.data).digest('hex') ||
+            media.data.subarray(0,4).toString() !== 'OggS' || !media.data.subarray(0,128).includes(Buffer.from('OpusHead'))) {
+          throw new Error('Discord native voice metadata is invalid.');
+        }
+        delete payload.content;
+        payload.flags = 8192;
+        payload.attachments[0].duration_secs = voice.durationSeconds;
+        payload.attachments[0].waveform = voice.waveform;
+      }
       const form = new FormData();
       form.set('payload_json', JSON.stringify(payload));
       form.set('files[0]', new Blob([media.data], {type:media.mimeType}), media.name);

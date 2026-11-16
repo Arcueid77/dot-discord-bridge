@@ -91,3 +91,18 @@ Explicit `DOT_BRIDGE_OUTBOUND=owner-text` enables owner-only text and fixed remi
 Native choices become one new input for the original dot. They bind to the requesting actor, conversation and acknowledged prompt message for up to ten minutes. A dot environment with programmatic file access can upload generated media in bounded encrypted chunks, verify its size and SHA-256, then submit the source-bound final reply. Files are limited to 5 MiB and this provider's supported media types and formats.
 
 Literal reminders support weekdays, fixed intervals, pause, resume and delivery history. Check `check_discord_outbound` before use and supply the saved reminder ID and current revision. Resuming skips old paused occurrences.
+
+
+## Tasks, consecutive messages and speech
+
+Task tools return a source-bound reference, passive deadline and remaining seconds. The original dot can save one complete text result. The paired owner can use `/tasks` and `/result reference` in the original DM. Source retention applies, and ambiguous delivery stays uncertain.
+
+The protected interaction policy accepts `queue`, for example `{"mode":"batch","window_ms":750,"max_messages":5}`. Modes are `independent`, `serial` and `batch`, defaulting to independent. A batch retains every source and replies through the last source as its anchor. Attachments, quotes and work already started are handled separately, with the existing conversation/member isolation.
+
+Linux operators can install eSpeak NG and the protected audio runtime, then set `DOT_BRIDGE_SPEECH_SYNTHESIS=local-espeak` and `DOT_BRIDGE_SPEECH_VOICE=zh`. The original dot uses `check_discord_speech` and `reply_discord_speech`, limited to 2000 characters and 120 seconds. The full text is also retained in the task record.
+
+An explicitly rejected one-time proactive send can be retried after owner confirmation using `retry_discord_outbound`, its original ID and current revision. The per-channel proactive switch still applies. Recurring reminders keep their edit/resume flow. Hosted-dot stop, reset and approvals use the original platform controls.
+
+## Native voice, video and stickers
+
+With `DISCORD_NATIVE_VOICE=enabled`, locally synthesized Opus can use a native Discord voice message with duration and waveform derived from real PCM. General uploaded audio keeps the attachment flow and retains captions. MP4/WebM video can be read and replied. PNG/APNG/GIF stickers can be read and returned as image attachments. Sticker reads refresh the verified source message and use fixed official CDN paths. Each attachment is limited to 5 MiB.

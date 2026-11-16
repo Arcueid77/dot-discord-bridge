@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {setTimeout as delay} from 'node:timers/promises';
 import {createProvider} from '../src/provider.js';
 import {channel} from '../src/channel.js';
+import {createHash} from 'node:crypto';
 
 test('revoked authorization blocks media and text before their final provider request',async t=>{
   const fx=await fixture(t),before=fx.calls.length,authorize=()=>{throw new Error('fixture revoked');};
@@ -23,7 +24,7 @@ async function fixture(t,options={}){
     {id:'4001',filename:'voice.ogg',content_type:'audio/ogg',size:4},
     {id:'4002',filename:'report.pdf',content_type:'application/pdf',size:4}
   ];
-  const original={id:'3000',channel_id:'2000',type:0,author:{id:'1000',bot:false},content:'',attachments};
+  const original={id:'3000',channel_id:'2000',type:0,author:{id:'1000',bot:false},content:'',attachments,...options.message};
   class Socket extends EventTarget{
     constructor(){super();socket=this;this.readyState=1;}
     send(){}
@@ -33,7 +34,7 @@ async function fixture(t,options={}){
   const fetch=async(url,init)=>{
     calls.push({url,init});assert.equal(init.redirect,'error');
     const parsed=new URL(url),path=parsed.pathname;
-    if(parsed.hostname==='cdn.discordapp.com'){
+    if(['cdn.discordapp.com','media.discordapp.net'].includes(parsed.hostname)){
       assert.equal(init.headers,undefined);
       return options.download?options.download(url,init):new Response('DATA',{headers:{'content-type':'application/octet-stream'}});
     }
@@ -46,7 +47,7 @@ async function fixture(t,options={}){
     if(path==='/api/v10/channels/2000/messages')return options.send?options.send(init):response({id:'8000',channel_id:'2000'});
     throw new Error('Unexpected synthetic endpoint');
   };
-  const provider=createProvider({credentials,fetch,WebSocket:Socket,random:()=>1,state:{get:k=>values.get(k),set:(k,v)=>values.set(k,v),delete:k=>values.delete(k)},onMessage:async m=>{received=m;}});
+  const provider=createProvider({credentials,nativeVoice:options.nativeVoice===true,fetch,WebSocket:Socket,random:()=>1,state:{get:k=>values.get(k),set:(k,v)=>values.set(k,v),delete:k=>values.delete(k)},onMessage:async m=>{received=m;}});
   t.after(()=>provider.stop());await provider.start();
   socket.frame({op:10,d:{heartbeat_interval:10000}});
   socket.frame({op:0,t:'READY',s:1,d:{session_id:'test-session',resume_gateway_url:'wss://gateway.discord.gg',user:{id:'9000',bot:true}}});
@@ -74,7 +75,7 @@ test('long answers use a single UTF-8 file reply with the same nonce and origina
 
 test('reads each attachment via refreshed original-message URL with no CDN credentials',async t=>{
   const fx=await fixture(t);
-  assert.deepEqual(channel.media,{read:['image','audio','file'],reply:['image','audio','file']});
+  assert.deepEqual(channel.media,{read:['image','audio','file','video','sticker'],reply:['image','audio','file','video','sticker']});
   assert.equal(JSON.stringify(fx.message.attachments).includes('4000'),false);
   assert.deepEqual(fx.message.replyContext.attachments.map(a=>a.id),['4000','4001','4002']);
   for(let i=0;i<3;i++)assert.deepEqual((await fx.provider.readAttachment({message:fx.message,attachmentIndex:i})).data,Buffer.from('DATA'));
@@ -152,4 +153,34 @@ test('uncertain multipart send happens once and stop drains pending upload',asyn
   const pending=assert.rejects(fx.provider.sendMediaReply({message:fx.message,media:{type:'file',mimeType:'application/pdf',name:'file.pdf',data:Buffer.from('A')},idempotencyKey:'fixed'}),/Discord transport failed/);
   await until(()=>sending);await fx.provider.stop();await pending;
   assert.equal(fx.calls.filter(c=>c.init.body instanceof FormData).length,1);
+});
+
+
+test('native Discord voice uses actual checked metadata and never drops a caption',async t=>{
+  const fx=await fixture(t,{nativeVoice:true});
+  const data=Buffer.concat([Buffer.from('OggS'),Buffer.alloc(24),Buffer.from('OpusHead'),Buffer.alloc(20)]);
+  const media={type:'audio',mimeType:'audio/ogg',name:'voice.ogg',data,voice:{durationSeconds:2,waveform:Buffer.alloc(20,80).toString('base64'),sha256:createHash('sha256').update(data).digest('hex')}};
+  await fx.provider.sendMediaReply({message:fx.message,media,idempotencyKey:'voice'});
+  const payload=JSON.parse(fx.calls.at(-1).init.body.get('payload_json'));
+  assert.equal(payload.flags,8192);assert.equal(Object.hasOwn(payload,'content'),false);
+  assert.equal(payload.attachments[0].duration_secs,2);
+  assert.equal(payload.attachments[0].waveform,media.voice.waveform);
+  const count=fx.calls.length;
+  await assert.rejects(fx.provider.sendMediaReply({message:fx.message,media:{...media,voice:{...media.voice,sha256:'0'.repeat(64)}},idempotencyKey:'bad'}));
+  assert.equal(fx.calls.length,count);
+  await fx.provider.sendMediaReply({message:fx.message,media,text:'caption',idempotencyKey:'caption'});
+  const regular=JSON.parse(fx.calls.at(-1).init.body.get('payload_json'));
+  assert.equal(regular.flags,undefined);assert.equal(regular.content,'caption');
+});
+
+test('Discord sticker bytes are refreshed against the original source before a fixed CDN read',async t=>{
+  const fx=await fixture(t,{message:{attachments:[],sticker_items:[{id:'5000',format_type:4,name:'sticker'}]}});
+  assert.equal(fx.message.attachments[0].kind,'sticker');
+  const result=await fx.provider.readAttachment({message:fx.message,attachmentIndex:0});
+  assert.equal(result.mimeType,'image/gif');
+  assert.equal(fx.calls.at(-1).url,'https://media.discordapp.net/stickers/5000.gif');
+  assert.equal(fx.calls.at(-1).init.headers,undefined);
+  await fx.provider.sendMediaReply({message:fx.message,media:{type:'sticker',mimeType:'image/gif',name:'sticker.gif',data:result.data},idempotencyKey:'one-sticker'});
+  const payload=JSON.parse(fx.calls.at(-1).init.body.get('payload_json'));
+  assert.equal(payload.sticker_ids,undefined);assert.equal(payload.attachments.length,1);
 });
